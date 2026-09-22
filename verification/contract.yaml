@@ -1,0 +1,30 @@
+contract_version: 1
+mechanisms:
+  automated: required
+  manual_uat: required
+  smoke_tests: required
+  performance: optional
+coverage_map:
+- requirement_id: REQ-TPL-001
+  mechanism: automated
+  evidence_path: verification/test_endpoints.py
+- requirement_id: REQ-TPL-002
+  mechanism: automated
+  evidence_path: verification/test_endpoints.py
+- requirement_id: REQ-TPL-003
+  mechanism: manual_uat
+  evidence_path: verification/uat.md
+seeded_defect_case:
+  id: SDC-001
+  path: verification/test_seeded_defect.py
+  description: Seeded defect injection via INJECT_DEFECT=1 env var; contract must
+    fail closed
+  must_fail: true
+  cadence: every default-branch run
+  last_run: '2026-09-22'
+  last_result: failed-as-expected
+auto_pass:
+  permitted: false
+  scope: null
+performance_profile: null
+evaluation_suite: null
