@@ -1,0 +1,53 @@
+contract_version: 2
+platform_compatibility: supported
+conformance_profile: service
+identity:
+  product_id: product-template
+  repository: product-template
+  team: platform
+classification:
+  reliability_criticality: medium
+  business_criticality: medium
+  onboarding_cost_band: M
+assignments:
+  - role: lead
+    person: bendrohit-eng
+    from: "2026-09-08"
+escalation:
+  owner: bendrohit-eng
+code:
+  languages: [python]
+verification:
+  performance: required
+  mechanisms: [automated]
+  coverage_map: []
+  seeded_defect_cases: []
+environments:
+  staging:
+    enabled: true
+  production:
+    enabled: true
+deployment:
+  strategy: blue-green
+reversibility_default: rollback
+infrastructure:
+  monthly_budget_band:
+    expected: 100
+    ceiling: 150
+dependencies: []
+security:
+  threat_model_reviewed: false
+ai_restrictions: []
+observability:
+  metrics: []
+  alerts: []
+recovery:
+  rto_hours: 24
+  rpo_hours: 24
+  restore_tested: "2026-09-08"
+operations:
+  support_model: business-hours
+  detection_expectation: next-business-morning
+  coverage_window: null
+business:
+  data_sensitivity: internal

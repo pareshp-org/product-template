@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  app:
+    image: python:3.11-slim
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=debug
+      - DATABASE_URL=postgres://app:secret@db:5432/app_dev
+    command: python -m http.server 8080
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app_dev
+    ports:
+      - "5432:5432"

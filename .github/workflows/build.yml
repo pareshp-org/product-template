@@ -1,0 +1,17 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build Artifact
+    uses: pareshp-org/control-plane/.github/workflows/build.yml@main
+    with:
+      ref: ${{ inputs.ref || github.sha }}
