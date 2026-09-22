@@ -1,0 +1,11 @@
+{
+  "product_id": "product-template",
+  "seeded_cases": [
+    {
+      "id": "SDC-001",
+      "description": "Seeded defect injection via INJECT_DEFECT=1 env var; contract must fail closed",
+      "passed": false,
+      "outcome": "validation_error_raised"
+    }
+  ]
+}
