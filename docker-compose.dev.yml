@@ -3,13 +3,17 @@ version: '3.8'
 services:
   app:
     image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - .:/app
     ports:
       - "${PORT:-8080}:8080"
     environment:
       - ENVIRONMENT=development
       - LOG_LEVEL=debug
+      - PORT=8080
       - DATABASE_URL=postgres://app:secret@db:5432/app_dev
-    command: python -m http.server 8080
+    command: python app.py --serve
 
   db:
     image: postgres:15-alpine

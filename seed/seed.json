@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "name": "Platform Reference Item Alpha",
+      "category": "core",
+      "status": "active",
+      "description": "Primary reference record for verification and testing"
+    },
+    {
+      "name": "Platform Reference Item Beta",
+      "category": "integration",
+      "status": "active",
+      "description": "Secondary integration test fixture record"
+    },
+    {
+      "name": "Platform Reference Item Gamma",
+      "category": "experimental",
+      "status": "pending",
+      "description": "Evaluation scenario fixture record"
+    }
+  ]
+}
