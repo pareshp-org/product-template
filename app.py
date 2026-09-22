@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -83,18 +84,25 @@ class MetricsCollector:
     """In-memory thread-safe metrics collector formatted for Prometheus exposition."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.start_time = time.time()
         self.request_counts: Dict[Tuple[str, str, int], int] = {}
         self.request_durations: List[float] = []
 
     def record_request(self, method: str, path: str, status_code: int, duration_sec: float) -> None:
-        key = (method, path, status_code)
-        self.request_counts[key] = self.request_counts.get(key, 0) + 1
-        self.request_durations.append(duration_sec)
-        if len(self.request_durations) > 1000:
-            self.request_durations = self.request_durations[-1000:]
+        with self._lock:
+            key = (method, path, status_code)
+            self.request_counts[key] = self.request_counts.get(key, 0) + 1
+            self.request_durations.append(duration_sec)
+            if len(self.request_durations) > 1000:
+                self.request_durations = self.request_durations[-1000:]
 
     def render_prometheus(self, product_id: str, db_entity_count: int) -> str:
+        with self._lock:
+            counts = dict(self.request_counts)
+            durations = list(self.request_durations) or [0.001]
+            start_t = self.start_time
+
         lines: List[str] = [
             "# HELP up Service availability status",
             "# TYPE up gauge",
@@ -107,10 +115,10 @@ class MetricsCollector:
             "# HELP http_requests_total Total number of HTTP requests processed",
             "# TYPE http_requests_total counter",
         ]
-        if not self.request_counts:
+        if not counts:
             lines.append(f'http_requests_total{{product_id="{product_id}",method="GET",handler="/metrics",status="200"}} 1')
         else:
-            for (m, p, s), count in sorted(self.request_counts.items()):
+            for (m, p, s), count in sorted(counts.items()):
                 lines.append(f'http_requests_total{{product_id="{product_id}",method="{m}",handler="{p}",status="{s}"}} {count}')
 
         lines.extend([
@@ -118,7 +126,6 @@ class MetricsCollector:
             "# HELP http_request_duration_seconds HTTP request latency histogram summary",
             "# TYPE http_request_duration_seconds histogram",
         ])
-        durations = self.request_durations or [0.001]
         sum_dur = sum(durations)
         count_dur = len(durations)
         buckets = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
@@ -137,7 +144,7 @@ class MetricsCollector:
             "",
             "# HELP process_uptime_seconds Elapsed seconds since service startup",
             "# TYPE process_uptime_seconds gauge",
-            f'process_uptime_seconds{{product_id="{product_id}"}} {int(time.time() - self.start_time)}',
+            f'process_uptime_seconds{{product_id="{product_id}"}} {int(time.time() - start_t)}',
             "",
         ])
         return "\n".join(lines) + "\n"
@@ -154,9 +161,11 @@ class DatabaseManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def check_health(self) -> Tuple[bool, str]:
