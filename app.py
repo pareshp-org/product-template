@@ -160,7 +160,14 @@ class DatabaseManager:
         self.db_path = db_path or get_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def get_connection(self) -> sqlite3.Connection:
+    def get_connection(self) -> Any:
+        db_url = os.environ.get("DATABASE_URL", "")
+        if db_url.startswith(("postgres://", "postgresql://")):
+            try:
+                import psycopg2
+                return psycopg2.connect(db_url)
+            except ImportError:
+                pass
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
