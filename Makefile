@@ -1,7 +1,7 @@
 # Makefile — MultiProduct OS Local Environment Contract (MasterSpec Section 33.1)
 # Implements the eight required targets: setup dev test uat-local migrate reset health parity
 
-.PHONY: setup dev test uat-local migrate reset health parity deploy restore
+.PHONY: setup dev test uat-local migrate reset health parity deploy restore backup
 
 setup:
 	@echo "Running setup..."
@@ -45,5 +45,10 @@ parity:
 deploy:
 	@echo "Deploying built artifact..."
 
+backup:
+	@echo "Creating database backup..."
+	@python app.py --backup $${BACKUP_PATH:-app.backup.db}
+
 restore:
 	@echo "Restoring backup to target environment..."
+	@python app.py --restore $${BACKUP_PATH:-app.backup.db}

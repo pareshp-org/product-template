@@ -169,11 +169,24 @@ class DatabaseManager:
             except ImportError:
                 pass
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            sync_mode = os.environ.get("SQLITE_SYNCHRONOUS", "NORMAL").upper()
+            if sync_mode in ("0", "OFF"):
+                conn.execute("PRAGMA synchronous = OFF")
+            elif sync_mode in ("2", "FULL"):
+                conn.execute("PRAGMA synchronous = FULL")
+            elif sync_mode in ("3", "EXTRA"):
+                conn.execute("PRAGMA synchronous = EXTRA")
+            else:
+                conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA busy_timeout = 30000")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     def check_health(self) -> Tuple[bool, str]:
         try:
@@ -261,11 +274,12 @@ class DatabaseManager:
         except Exception:
             return 0
 
-    def list_items(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_items(self, limit: int = 100, desc: bool = False) -> List[Dict[str, Any]]:
         conn = self.get_connection()
         try:
+            order_by = "ORDER BY id DESC" if desc else "ORDER BY id ASC"
             rows = conn.execute(
-                "SELECT id, name, category, status, payload, created_at, updated_at FROM items ORDER BY id LIMIT ?",
+                f"SELECT id, name, category, status, payload, created_at, updated_at FROM items {order_by} LIMIT ?",
                 (limit,),
             ).fetchall()
             result = []
@@ -348,6 +362,177 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    def checkpoint(self, mode: str = "PASSIVE") -> Dict[str, Any]:
+        """Checkpoint the WAL journal into the main database.
+
+        mode: PASSIVE, FULL, RESTART, or TRUNCATE
+        Returns: {mode: str, busy: int, log_frames: int, checkpointed_frames: int}
+        """
+        valid_modes = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
+        mode_upper = mode.upper()
+        if mode_upper not in valid_modes:
+            raise ValueError(f"Invalid checkpoint mode: {mode}. Must be one of {valid_modes}")
+        conn = self.get_connection()
+        try:
+            res = conn.execute(f"PRAGMA wal_checkpoint({mode_upper})").fetchone()
+            return {
+                "mode": mode_upper,
+                "busy": res[0] if res else 0,
+                "log_frames": res[1] if res else 0,
+                "checkpointed_frames": res[2] if res else 0,
+            }
+        finally:
+            conn.close()
+
+    def backup(self, target_path: Path | str, pages: int = -1) -> Path:
+        """Create a consistent online backup using SQLite Online Backup API.
+
+        Safely captures WAL and database pages without blocking concurrent readers.
+        """
+        target = Path(target_path).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.checkpoint("PASSIVE")
+        except Exception:
+            pass
+
+        src_conn = self.get_connection()
+        dest_conn = sqlite3.connect(str(target), timeout=30.0)
+        try:
+            with dest_conn:
+                src_conn.backup(dest_conn, pages=pages)
+            dest_conn.execute("PRAGMA foreign_keys = ON")
+            dest_conn.execute("PRAGMA journal_mode = WAL")
+            ic = dest_conn.execute("PRAGMA integrity_check").fetchone()
+            if not ic or ic[0] != "ok":
+                raise RuntimeError(f"Backup verification failed integrity check: {ic}")
+        finally:
+            dest_conn.close()
+            src_conn.close()
+        return target
+
+    def restore(self, backup_path: Path | str) -> bool:
+        """Restore database from backup file with disaster recovery resilience.
+
+        Handles online restoration as well as physical replacement in case of corruption.
+        """
+        backup_file = Path(backup_path).resolve()
+        if not backup_file.is_file():
+            raise FileNotFoundError(f"Backup file not found: {backup_file}")
+
+        test_conn = sqlite3.connect(str(backup_file), timeout=10.0)
+        try:
+            ic = test_conn.execute("PRAGMA integrity_check").fetchone()
+            if not ic or ic[0] != "ok":
+                raise RuntimeError(f"Source backup failed integrity check: {ic}")
+        finally:
+            test_conn.close()
+
+        restored_online = False
+        dest_conn = None
+        src_conn = None
+        try:
+            dest_conn = self.get_connection()
+            src_conn = sqlite3.connect(str(backup_file), timeout=30.0)
+            with dest_conn:
+                src_conn.backup(dest_conn)
+            dest_conn.execute("PRAGMA journal_mode = WAL")
+            dest_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            restored_online = True
+        except (sqlite3.DatabaseError, Exception):
+            restored_online = False
+        finally:
+            if dest_conn:
+                try:
+                    dest_conn.close()
+                except Exception:
+                    pass
+            if src_conn:
+                try:
+                    src_conn.close()
+                except Exception:
+                    pass
+
+        if not restored_online:
+            import gc
+            import shutil
+            import time
+            gc.collect()
+            time.sleep(0.05)
+            wal_file = self.db_path.with_name(self.db_path.name + "-wal")
+            shm_file = self.db_path.with_name(self.db_path.name + "-shm")
+            if self.db_path.exists():
+                corrupt_quarantine = self.db_path.with_name(f"{self.db_path.name}.corrupt.{int(time.time())}")
+                replaced = False
+                for _ in range(5):
+                    try:
+                        self.db_path.rename(corrupt_quarantine)
+                        replaced = True
+                        break
+                    except Exception:
+                        gc.collect()
+                        time.sleep(0.05)
+                if not replaced:
+                    for _ in range(5):
+                        try:
+                            self.db_path.unlink(missing_ok=True)
+                            break
+                        except Exception:
+                            gc.collect()
+                            time.sleep(0.05)
+
+            if wal_file.exists():
+                wal_file.unlink(missing_ok=True)
+            if shm_file.exists():
+                shm_file.unlink(missing_ok=True)
+
+            shutil.copy2(backup_file, self.db_path)
+            conn = self.get_connection()
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                conn.close()
+
+        return True
+
+    def verify_integrity(self) -> Dict[str, Any]:
+        """Run comprehensive SQLite health, journal mode, pragmas, and integrity checks."""
+        conn = self.get_connection()
+        try:
+            jm = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            sync = conn.execute("PRAGMA synchronous").fetchone()[0]
+            bt = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            ic_rows = conn.execute("PRAGMA integrity_check").fetchall()
+            integrity_ok = len(ic_rows) == 1 and ic_rows[0][0] == "ok"
+            qc_rows = conn.execute("PRAGMA quick_check").fetchall()
+            quick_ok = len(qc_rows) == 1 and qc_rows[0][0] == "ok"
+            fk_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+            fk_ok = len(fk_rows) == 0
+
+            has_items = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'"
+            ).fetchone() is not None
+            count = 0
+            if has_items:
+                count_row = conn.execute("SELECT count(*) FROM items").fetchone()
+                count = count_row[0] if count_row else 0
+
+            return {
+                "journal_mode": jm,
+                "synchronous": sync,
+                "busy_timeout": bt,
+                "foreign_keys": fk,
+                "integrity_ok": integrity_ok,
+                "quick_ok": quick_ok,
+                "foreign_key_ok": fk_ok,
+                "row_count": count,
+                "healthy": integrity_ok and quick_ok and fk_ok and (jm.lower() == "wal"),
+            }
+        finally:
+            conn.close()
+
 
 class ServiceRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler implementing MasterSpec Section 41.2 endpoints and domain APIs."""
@@ -359,6 +544,12 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        cid = self.headers.get("X-Correlation-ID") or self.headers.get("x-correlation-id")
+        if cid:
+            self.send_header("X-Correlation-ID", cid)
+        tp = self.headers.get("traceparent") or self.headers.get("Traceparent")
+        if tp:
+            self.send_header("traceparent", tp)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -367,6 +558,12 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        cid = self.headers.get("X-Correlation-ID") or self.headers.get("x-correlation-id")
+        if cid:
+            self.send_header("X-Correlation-ID", cid)
+        tp = self.headers.get("traceparent") or self.headers.get("Traceparent")
+        if tp:
+            self.send_header("traceparent", tp)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -418,7 +615,10 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
             # Domain Collection Endpoint: /api/v1/items
             elif path == "/api/v1/items":
                 status_code = HTTPStatus.OK
-                items = self.db.list_items()
+                q_params = parse_qs(parsed.query)
+                limit_val = int(q_params.get("limit", [100])[0]) if "limit" in q_params else 100
+                desc_val = q_params.get("desc", ["false"])[0].lower() in ("true", "1")
+                items = self.db.list_items(limit=limit_val, desc=desc_val)
                 self.send_json(status_code, {"items": items, "count": len(items)})
 
             # Domain Single Entity Endpoint: /api/v1/items/<id>
@@ -470,8 +670,50 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
                 self.send_json(status_code, {"error": "Invalid JSON body"})
                 return
 
-            if path == "/api/v1/items":
+            cid = self.headers.get("X-Correlation-ID") or self.headers.get("x-correlation-id")
+            tp = self.headers.get("traceparent") or self.headers.get("Traceparent")
+
+            if path in ("/api/v1/items", "/api/v1/events", "/api/v1/webhooks"):
                 created = self.db.create_item(data)
+                if data.get("cascade"):
+                    prod_id = get_product_id()
+                    try:
+                        import sys
+                        from pathlib import Path
+                        mesh_path = Path(__file__).resolve().parent.parent
+                        if str(mesh_path) not in sys.path:
+                            sys.path.insert(0, str(mesh_path))
+
+                        if prod_id in ("Product-1", "iam"):
+                            from event_mesh import dispatch_user_created_workflow
+                            user_email = data.get("email")
+                            if not user_email and isinstance(data.get("payload"), dict):
+                                user_email = data.get("payload", {}).get("email")
+                            if not user_email:
+                                user_email = f"{data.get('name', 'user')}@enterprise.internal"
+
+                            cascade_res = dispatch_user_created_workflow(
+                                user_id=created.get("id"),
+                                username=data.get("name", f"user-{created.get('id')}"),
+                                email=user_email,
+                                role=data.get("role", "customer"),
+                                correlation_id=cid,
+                                traceparent=tp,
+                            )
+                            created["cascade"] = cascade_res
+                        elif prod_id in ("Product-3", "orders"):
+                            from event_mesh import dispatch_order_placed_workflow
+                            cascade_res = dispatch_order_placed_workflow(
+                                order_id=created.get("id"),
+                                user_id=data.get("customer_id", 1),
+                                total_amount=float(data.get("amount", 99.99)),
+                                correlation_id=cid,
+                                traceparent=tp,
+                            )
+                            created["cascade"] = cascade_res
+                    except Exception as mesh_err:
+                        created["cascade"] = {"error": str(mesh_err)}
+
                 status_code = HTTPStatus.CREATED
                 self.send_json(status_code, created)
             else:
@@ -541,6 +783,10 @@ def main() -> None:
     parser.add_argument("--migrate", action="store_true", help="Apply SQL database migrations")
     parser.add_argument("--seed", action="store_true", help="Seed database with initial records")
     parser.add_argument("--health", action="store_true", help="Perform offline database health check")
+    parser.add_argument("--backup", metavar="TARGET_PATH", help="Create an online backup of the SQLite database")
+    parser.add_argument("--restore", metavar="SOURCE_PATH", help="Restore the SQLite database from a backup file")
+    parser.add_argument("--checkpoint", choices=["PASSIVE", "FULL", "RESTART", "TRUNCATE"], nargs="?", const="PASSIVE", help="Execute a WAL checkpoint")
+    parser.add_argument("--verify-db", action="store_true", help="Run comprehensive database integrity and PRAGMA checks")
 
     args = parser.parse_args()
     db = DatabaseManager()
@@ -558,7 +804,37 @@ def main() -> None:
         print(f"Database health: {detail}")
         sys.exit(0 if healthy else 1)
 
-    if args.serve or (not args.migrate and not args.seed and not args.health):
+    if args.backup:
+        out_path = db.backup(args.backup)
+        print(f"Database successfully backed up to {out_path}")
+        sys.exit(0)
+
+    if args.restore:
+        db.restore(args.restore)
+        print(f"Database successfully restored from {args.restore}")
+        sys.exit(0)
+
+    if args.checkpoint:
+        res = db.checkpoint(args.checkpoint)
+        print(f"WAL Checkpoint ({res['mode']}): busy={res['busy']}, log_frames={res['log_frames']}, checkpointed={res['checkpointed_frames']}")
+        sys.exit(0)
+
+    if args.verify_db:
+        res = db.verify_integrity()
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("healthy") else 1)
+
+    has_standalone_cmd = (
+        args.migrate
+        or args.seed
+        or args.health
+        or args.backup
+        or args.restore
+        or args.checkpoint
+        or args.verify_db
+    )
+
+    if args.serve or not has_standalone_cmd:
         run_server(args.host, args.port)
 
 
